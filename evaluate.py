@@ -84,7 +84,8 @@ def generate_dataset(num_peers, num_docs_per_peer, vocab_size, real_vocab=None):
 
 def run_baseline_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000, real_vocab=None):
     """
-    Runs the baseline simulation and returns bandwidth and latency.
+    Runs the baseline simulation with multi-term query support and returns bandwidth and latency.
+    For multi-term queries, fetches posting lists for each term and computes intersection.
     """
     peers = [Peer(i) for i in range(num_peers)]
     dht = BaselineDHT(peers)
@@ -103,24 +104,50 @@ def run_baseline_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=10
 
     for query in queries:
         querying_peer_id = random.randint(0, num_peers - 1)
-        keyword = query.split()[0] if query.split() else ""
-        if not keyword:
+        query_terms = [term for term in query.split() if term]
+        if not query_terms:
             continue
 
-        total_latency += NETWORK_HOP_TIME * 2 
-        
-        responsible_peer_id, posting_list = dht.lookup(keyword)
+        # For multi-term queries, fetch posting list for each term
+        posting_lists = []
+        query_bandwidth = 0
+        query_latency = 0
 
-        if posting_list is not None: 
-            successful_queries += 1
-            posting_list_size = max(4, len(posting_list) * 4)
-            transfer_time = posting_list_size / BANDWIDTH_RATE
-            
-            total_bandwidth += posting_list_size
+        for term in query_terms:
+            query_latency += NETWORK_HOP_TIME * 2  # One hop pair per term lookup
+
+            responsible_peer_id, posting_list = dht.lookup(term)
+
+            if posting_list is not None and len(posting_list) > 0:
+                posting_lists.append(set(posting_list))
+                posting_list_size = max(4, len(posting_list) * 4)
+                transfer_time = posting_list_size / BANDWIDTH_RATE
+
+                query_bandwidth += posting_list_size
+                query_latency += transfer_time
+
+        # Compute intersection of all posting lists (documents containing ALL terms)
+        if posting_lists:
+            intersection = posting_lists[0]
+            for pl in posting_lists[1:]:
+                intersection = intersection.intersection(pl)
+
+            # Query succeeds if intersection is non-empty
+            if len(intersection) > 0:
+                successful_queries += 1
+
+            total_bandwidth += query_bandwidth
+            total_latency += query_latency
+
     return total_bandwidth, total_latency, (successful_queries / len(queries)) * 100 if len(queries) > 0 else 0
 
 # Placeholder for other simulation functions
 def run_bloom_filter_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000, real_vocab=None):
+    """
+    Runs Bloom filter simulation with multi-term query support.
+    For multi-term queries, fetches Bloom filter for each term and computes intersection locally.
+    This is the key optimization: intersection happens using compact Bloom filters, not full posting lists.
+    """
     peers = [Peer(i) for i in range(num_peers)]
     # bloom filter cap should be based on max posting list size (num_peers not vocab_size remember
     # each keywords posting list can have at most num_peers entries
@@ -142,36 +169,57 @@ def run_bloom_filter_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_siz
 
     for query in queries:
         querying_peer_id = random.randint(0, num_peers - 1)
-        query_words = query.split()
-        keyword = random.choice(query_words) if query_words else ""
-        if not keyword:
+        query_terms = [term for term in query.split() if term]
+        if not query_terms:
             continue
 
-        total_latency += NETWORK_HOP_TIME * 2
-        
-        responsible_peer_id, bloom_filter = dht.lookup(keyword)
+        # Fetch Bloom filter for each term
+        bloom_filters = []
+        query_bandwidth = 0
+        query_latency = 0
 
-        if bloom_filter is not None:
-            successful_queries += 1
-            bloom_filter_size = bloom_filter.num_bits / 8  # size in bytes
-            transfer_time = bloom_filter_size / BANDWIDTH_RATE
-            
-            total_bandwidth += bloom_filter_size
-            total_latency += transfer_time
-            
-            # second phase we need to get candidate list - simplified
-            # assume an average of error_rate * num_peers false positives
-            # and that 10% of these actually contain the keyword.
-            avg_candidate_list_entries = max(1, int(num_peers * dht.error_rate * 0.1))
-            candidate_list_size = avg_candidate_list_entries * 4
-            
-            total_bandwidth += candidate_list_size
-            total_latency += candidate_list_size / BANDWIDTH_RATE
-            total_latency += NETWORK_HOP_TIME 
+        for term in query_terms:
+            query_latency += NETWORK_HOP_TIME * 2  # One hop pair per term lookup
+
+            responsible_peer_id, bloom_filter = dht.lookup(term)
+
+            if bloom_filter is not None:
+                bloom_filters.append(bloom_filter)
+                bloom_filter_size = bloom_filter.num_bits / 8  # size in bytes
+                transfer_time = bloom_filter_size / BANDWIDTH_RATE
+
+                query_bandwidth += bloom_filter_size
+                query_latency += transfer_time
+
+        # Compute intersection locally using Bloom filters
+        # Test each peer ID against ALL Bloom filters
+        if bloom_filters:
+            candidate_peers = []
+            for peer_id in range(num_peers):
+                # Peer is a candidate if it appears in ALL Bloom filters (intersection)
+                if all(peer_id in bf for bf in bloom_filters):
+                    candidate_peers.append(peer_id)
+
+            # Query succeeds if we have candidates
+            if len(candidate_peers) > 0:
+                successful_queries += 1
+
+            # Second phase: transfer candidate list back
+            candidate_list_size = len(candidate_peers) * 4  # 4 bytes per peer ID
+            query_bandwidth += candidate_list_size
+            query_latency += candidate_list_size / BANDWIDTH_RATE
+            query_latency += NETWORK_HOP_TIME  # One hop for candidate list return
+
+            total_bandwidth += query_bandwidth
+            total_latency += query_latency
 
     return total_bandwidth, total_latency, (successful_queries / len(queries)) * 100 if len(queries) > 0 else 0
 
 def run_caching_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000, real_vocab=None):
+    """
+    Runs caching simulation with multi-term query support.
+    Caches individual terms (not full queries) so popular terms benefit multiple different queries.
+    """
     peers = [Peer(i, cache_size=50) for i in range(num_peers)]
     bloom_capacity = num_peers
     dht = BloomFilterDHT(peers, capacity=bloom_capacity, error_rate=0.01)
@@ -188,6 +236,7 @@ def run_caching_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=100
     total_bandwidth = 0
     total_latency = 0
     cache_hits = 0
+    total_term_lookups = 0
     successful_queries = 0
     total_queries = 0
 
@@ -195,37 +244,70 @@ def run_caching_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=100
         total_queries += 1
         querying_peer_id = random.randint(0, num_peers - 1)
         querying_peer = peers[querying_peer_id]
-        query_words = query.split()
-        keyword = random.choice(query_words) if query_words else ""
-        if not keyword:
+        query_terms = [term for term in query.split() if term]
+        if not query_terms:
             continue
 
-        cached_result = querying_peer.get_from_cache(keyword)
-        if cached_result:
-            cache_hits += 1
-            total_latency += NETWORK_HOP_TIME
-            successful_queries += 1
-        else:
-            total_latency += NETWORK_HOP_TIME * 2
-            responsible_peer_id, bloom_filter = dht.lookup(keyword)
+        # Fetch Bloom filter for each term (mix of cache hits and network lookups)
+        bloom_filters = []
+        query_bandwidth = 0
+        query_latency = 0
 
-            if bloom_filter is not None:
+        for term in query_terms:
+            total_term_lookups += 1
+            cached_result = querying_peer.get_from_cache(term)
+
+            if cached_result:
+                # Cache hit - no network transfer needed
+                cache_hits += 1
+                bloom_filters.append(cached_result)
+                query_latency += NETWORK_HOP_TIME  # Local cache lookup time
+            else:
+                # Cache miss - fetch from DHT
+                query_latency += NETWORK_HOP_TIME * 2  # Network roundtrip
+
+                responsible_peer_id, bloom_filter = dht.lookup(term)
+
+                if bloom_filter is not None:
+                    bloom_filters.append(bloom_filter)
+                    bloom_filter_size = bloom_filter.num_bits / 8
+                    transfer_time = bloom_filter_size / BANDWIDTH_RATE
+
+                    query_bandwidth += bloom_filter_size
+                    query_latency += transfer_time
+
+                    # Add to cache for future queries
+                    querying_peer.add_to_cache(term, bloom_filter)
+
+        # Compute intersection locally using Bloom filters (from cache and network)
+        if bloom_filters:
+            candidate_peers = []
+            for peer_id in range(num_peers):
+                # Peer is a candidate if it appears in ALL Bloom filters
+                if all(peer_id in bf for bf in bloom_filters):
+                    candidate_peers.append(peer_id)
+
+            # Query succeeds if we have candidates
+            if len(candidate_peers) > 0:
                 successful_queries += 1
-                bloom_filter_size = bloom_filter.num_bits / 8
-                transfer_time = bloom_filter_size / BANDWIDTH_RATE
-                
-                total_bandwidth += bloom_filter_size
-                total_latency += transfer_time
-                
-                querying_peer.add_to_cache(keyword, bloom_filter)
 
-    cache_hit_rate = (cache_hits / total_queries) * 100 if total_queries > 0 else 0
+            # Second phase: transfer candidate list (unless all terms were cache hits and candidate list is small)
+            # For simplicity, we still count this bandwidth
+            candidate_list_size = len(candidate_peers) * 4
+            query_bandwidth += candidate_list_size
+            query_latency += candidate_list_size / BANDWIDTH_RATE
+            query_latency += NETWORK_HOP_TIME
+
+            total_bandwidth += query_bandwidth
+            total_latency += query_latency
+
+    cache_hit_rate = (cache_hits / total_term_lookups) * 100 if total_term_lookups > 0 else 0
     return total_bandwidth, total_latency, cache_hit_rate, (successful_queries / total_queries) * 100 if total_queries > 0 else 0
 
 def run_churn_sim_baseline_or_bloom(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000, real_vocab=None, churn_rate=10, dht_type=BaselineDHT):
     '''
-    runs the sim w/ network churn for BaselineDHT or BloomFilterDHT
-    and returns bandwidth, latency, and query success rate
+    Runs the sim w/ network churn for BaselineDHT or BloomFilterDHT with multi-term query support.
+    Returns bandwidth, latency, and query success rate.
     '''
     peers = [Peer(i) for i in range(num_peers)]
     if dht_type == BaselineDHT:
@@ -233,7 +315,7 @@ def run_churn_sim_baseline_or_bloom(queries, num_peers=100, num_docs_per_peer=50
     elif dht_type == BloomFilterDHT:
         bloom_capacity = num_peers
         dht_instance = BloomFilterDHT(peers, capacity=bloom_capacity, error_rate=0.01)
-    
+
     documents, _ = generate_dataset(num_peers, num_docs_per_peer, vocab_size, real_vocab)
 
     for peer_id, docs in documents.items():
@@ -247,7 +329,7 @@ def run_churn_sim_baseline_or_bloom(queries, num_peers=100, num_docs_per_peer=50
     total_latency = 0
     successful_queries = 0
     total_queries = 0
-    
+
     failed_peers_timeline = []
 
     for i, query in enumerate(queries):
@@ -261,41 +343,74 @@ def run_churn_sim_baseline_or_bloom(queries, num_peers=100, num_docs_per_peer=50
 
         total_queries += 1
         querying_peer_id = random.randint(0, num_peers - 1)
-        query_words = query.split()
-        keyword = random.choice(query_words) if query_words else ""
-        if not keyword:
+        query_terms = [term for term in query.split() if term]
+        if not query_terms:
             continue
 
-        total_latency += NETWORK_HOP_TIME * 2
-        
-        responsible_peer_id, result = dht_instance.lookup(keyword)
+        # Fetch data for each term
+        results = []
+        query_bandwidth = 0
+        query_latency = 0
 
-        if result is not None: 
-            successful_queries += 1
-            if dht_type == BaselineDHT: 
-                # baseline estimate posting list size
-                posting_list_size = max(4, len(result) * 4) 
-                transfer_time = posting_list_size / BANDWIDTH_RATE
-                total_bandwidth += posting_list_size
-                total_latency += transfer_time
+        for term in query_terms:
+            query_latency += NETWORK_HOP_TIME * 2
+
+            responsible_peer_id, result = dht_instance.lookup(term)
+
+            if result is not None:
+                results.append(result)
+
+                if dht_type == BaselineDHT:
+                    # Baseline: result is posting list
+                    posting_list_size = max(4, len(result) * 4)
+                    transfer_time = posting_list_size / BANDWIDTH_RATE
+                    query_bandwidth += posting_list_size
+                    query_latency += transfer_time
+
+                elif dht_type == BloomFilterDHT:
+                    # Bloom filter: result is Bloom filter
+                    bloom_filter_size = result.num_bits / 8
+                    transfer_time = bloom_filter_size / BANDWIDTH_RATE
+                    query_bandwidth += bloom_filter_size
+                    query_latency += transfer_time
+
+        # Compute intersection based on DHT type
+        if results:
+            if dht_type == BaselineDHT:
+                # Baseline: intersect posting lists
+                intersection = set(results[0])
+                for result in results[1:]:
+                    intersection = intersection.intersection(set(result))
+
+                if len(intersection) > 0:
+                    successful_queries += 1
+
             elif dht_type == BloomFilterDHT:
-                bloom_filter_size = result.num_bits / 8
-                transfer_time = bloom_filter_size / BANDWIDTH_RATE
-                total_bandwidth += bloom_filter_size
-                total_latency += transfer_time
-                # second phase cost for Bloom filter
-                avg_candidate_list_entries = max(1, int(num_peers * dht_instance.error_rate * 0.1))
-                candidate_list_size = avg_candidate_list_entries * 4
-                total_bandwidth += candidate_list_size
-                total_latency += candidate_list_size / BANDWIDTH_RATE
-                total_latency += NETWORK_HOP_TIME # One hop for candidate list return
-        
+                # Bloom filter: test candidates against all filters
+                candidate_peers = []
+                for peer_id in range(num_peers):
+                    if all(peer_id in bf for bf in results):
+                        candidate_peers.append(peer_id)
+
+                if len(candidate_peers) > 0:
+                    successful_queries += 1
+
+                # Second phase: candidate list transfer
+                candidate_list_size = len(candidate_peers) * 4
+                query_bandwidth += candidate_list_size
+                query_latency += candidate_list_size / BANDWIDTH_RATE
+                query_latency += NETWORK_HOP_TIME
+
+            total_bandwidth += query_bandwidth
+            total_latency += query_latency
+
     return total_bandwidth, total_latency, (successful_queries / total_queries) * 100 if total_queries > 0 else 0
 
 
 def run_churn_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000, real_vocab=None, churn_rate=10):
     """
-    Runs the caching simulation with churn and returns bandwidth, latency, cache hit rate, and query success rate.
+    Runs the caching simulation with churn and multi-term query support.
+    Returns bandwidth, latency, cache hit rate, and query success rate.
     """
     peers = [Peer(i, cache_size=50) for i in range(num_peers)]
     bloom_capacity = num_peers
@@ -312,9 +427,10 @@ def run_churn_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000,
     total_bandwidth = 0
     total_latency = 0
     cache_hits = 0
+    total_term_lookups = 0
     successful_queries = 0
     total_queries = 0
-    
+
     failed_peers_timeline = []
 
     for i, query in enumerate(queries):
@@ -330,32 +446,62 @@ def run_churn_sim(queries, num_peers=100, num_docs_per_peer=50, vocab_size=1000,
         total_queries += 1
         querying_peer_id = random.randint(0, num_peers - 1)
         querying_peer = peers[querying_peer_id]
-        keyword = query.split()[0] if query.split() else ""
-        if not keyword:
+        query_terms = [term for term in query.split() if term]
+        if not query_terms:
             continue
 
-        cached_result = querying_peer.get_from_cache(keyword)
-        if cached_result:
-            cache_hits += 1
-            total_latency += NETWORK_HOP_TIME
-            successful_queries += 1
-        else:
-            total_latency += NETWORK_HOP_TIME * 2
-            responsible_peer_id, bloom_filter = dht.lookup(keyword)
+        # Fetch Bloom filter for each term (mix of cache hits and network lookups)
+        bloom_filters = []
+        query_bandwidth = 0
+        query_latency = 0
 
-            if bloom_filter:
+        for term in query_terms:
+            total_term_lookups += 1
+            cached_result = querying_peer.get_from_cache(term)
+
+            if cached_result:
+                # Cache hit
+                cache_hits += 1
+                bloom_filters.append(cached_result)
+                query_latency += NETWORK_HOP_TIME
+            else:
+                # Cache miss - fetch from DHT
+                query_latency += NETWORK_HOP_TIME * 2
+
+                responsible_peer_id, bloom_filter = dht.lookup(term)
+
+                if bloom_filter:
+                    bloom_filters.append(bloom_filter)
+                    bloom_filter_size = bloom_filter.num_bits / 8
+                    transfer_time = bloom_filter_size / BANDWIDTH_RATE
+
+                    query_bandwidth += bloom_filter_size
+                    query_latency += transfer_time
+
+                    querying_peer.add_to_cache(term, bloom_filter)
+
+        # Compute intersection using Bloom filters
+        if bloom_filters:
+            candidate_peers = []
+            for peer_id in range(num_peers):
+                if all(peer_id in bf for bf in bloom_filters):
+                    candidate_peers.append(peer_id)
+
+            if len(candidate_peers) > 0:
                 successful_queries += 1
-                bloom_filter_size = bloom_filter.num_bits / 8
-                transfer_time = bloom_filter_size / BANDWIDTH_RATE
-                
-                total_bandwidth += bloom_filter_size
-                total_latency += transfer_time
-                
-                querying_peer.add_to_cache(keyword, bloom_filter)
 
-    cache_hit_rate = (cache_hits / total_queries) * 100 if total_queries > 0 else 0
+            # Second phase: candidate list transfer
+            candidate_list_size = len(candidate_peers) * 4
+            query_bandwidth += candidate_list_size
+            query_latency += candidate_list_size / BANDWIDTH_RATE
+            query_latency += NETWORK_HOP_TIME
+
+            total_bandwidth += query_bandwidth
+            total_latency += query_latency
+
+    cache_hit_rate = (cache_hits / total_term_lookups) * 100 if total_term_lookups > 0 else 0
     query_success_rate = (successful_queries / total_queries) * 100 if total_queries > 0 else 0
-    
+
     return total_bandwidth, total_latency, cache_hit_rate, query_success_rate
 
 if __name__ == "__main__":
