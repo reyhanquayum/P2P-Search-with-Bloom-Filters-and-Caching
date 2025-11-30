@@ -1,6 +1,3 @@
-"""
-This module contains the main simulation logic.
-"""
 import sys
 import numpy as np
 from peer import Peer
@@ -13,17 +10,11 @@ class Simulation:
         self.dht = None
 
     def setup(self):
-        """
-        Set up the simulation environment.
-        """
-        # Create peers
         for i in range(self.num_peers):
             self.peers.append(Peer(peer_id=i))
 
-        # Create DHT
         self.dht = DHT(self.peers)
 
-        # Assign documents to peers
         documents = {
             0: ["apple banana orange", "apple grape"],
             1: ["orange grape kiwi", "kiwi strawberry"],
@@ -37,7 +28,6 @@ class Simulation:
                     self.peers[peer_id].add_document(doc)
                 self.peers[peer_id].create_index()
 
-        # Publish keywords to DHT
         for peer in self.peers:
             for keyword in peer.index:
                 self.dht.publish(keyword, peer.peer_id)
@@ -47,9 +37,7 @@ class Simulation:
         """
         Run the simulation.
         """
-        # Create a skewed query distribution
         keywords = ["apple", "banana", "orange", "grape", "kiwi", "strawberry", "blueberry", "raspberry"]
-        # Skewed distribution, 'apple' will be most popular
         keyword_distribution = np.random.zipf(a=2, size=num_queries) % len(keywords)
 
         queries = [keywords[i] for i in keyword_distribution]
@@ -62,13 +50,10 @@ class Simulation:
             querying_peer_id = np.random.randint(0, self.num_peers)
             querying_peer = self.peers[querying_peer_id]
 
-            # Check cache first
             cached_result = querying_peer.get_from_cache(keyword_to_query)
             if cached_result:
                 cache_hits += 1
-                # print(f"Query for '{keyword_to_query}' from peer {querying_peer_id}: Cache hit!")
             else:
-                # print(f"Query for '{keyword_to_query}' from peer {querying_peer_id}: Cache miss.")
                 responsible_peer_id, bloom_filter = self.dht.lookup(keyword_to_query)
                 if bloom_filter:
                     querying_peer.add_to_cache(keyword_to_query, bloom_filter)

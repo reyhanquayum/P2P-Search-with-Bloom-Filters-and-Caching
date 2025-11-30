@@ -77,12 +77,9 @@ class BloomFilterDHT:
 
     def remove_peer(self, peer):
         self.peers.remove(peer)
-        # for simplicity not re-hashing the keywords
-        # just gonna remove the keywords published by the peer
         for responsible_peer_id, keywords in self.keyword_map.items():
             for keyword, bloom_filter in keywords.items():
                 if peer.peer_id in bloom_filter:
-                    # not ideal, as we can't remove items from a bloom filter
                     pass
     
     def fail_peer(self, peer_id):
