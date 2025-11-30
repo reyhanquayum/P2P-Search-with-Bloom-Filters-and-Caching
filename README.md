@@ -2,6 +2,8 @@
 
 quick sim of a peer-to-peer distributed hash table with bloom filters and caching for a class project.
 
+note that 
+
 ## why
 
 comparing different indexing strategies (baseline DHT, bloom filter DHT, and caching) across different query patterns and network conditions.
